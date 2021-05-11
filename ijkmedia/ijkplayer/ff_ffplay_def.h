@@ -874,7 +874,7 @@ inline static void ffp_notify_msg4(FFPlayer *ffp, int what, int arg1, int arg2, 
 inline static void ffp_remove_msg(FFPlayer *ffp, int what) {
     msg_queue_remove(&ffp->msg_queue, what);
 }
-
+#define AVERROR_QCRP               FFERRTAG( 'Q','C','R','P')
 inline static const char *ffp_get_error_string(int error) {
     switch (error) {
         case AVERROR(ENOMEM):       return "AVERROR(ENOMEM)";       // 12
@@ -883,6 +883,7 @@ inline static const char *ffp_get_error_string(int error) {
         case AVERROR(ETIMEDOUT):    return "AVERROR(ETIMEDOUT)";    // 60
         case AVERROR_EOF:           return "AVERROR_EOF";
         case AVERROR_EXIT:          return "AVERROR_EXIT";
+        case AVERROR_QCRP:          return "AVERROR_QCRP";
     }
     return "unknown";
 }

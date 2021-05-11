@@ -107,6 +107,7 @@
 #include "ff_ffplay_options.h"
 
 static AVPacket flush_pkt;
+int quit_cur_read = 0; //是否退出当前读取的socket
 
 #if CONFIG_AVFILTER
 // FFP_MERGE: opt_add_vfilter
@@ -251,6 +252,7 @@ static void packet_queue_flush(PacketQueue *q)
     q->size = 0;
     q->duration = 0;
     SDL_UnlockMutex(q->mutex);
+
 }
 
 static void packet_queue_destroy(PacketQueue *q)
@@ -344,8 +346,9 @@ static int packet_queue_get_or_buffering(FFPlayer *ffp, PacketQueue *q, AVPacket
         if (new_packet < 0)
             return -1;
         else if (new_packet == 0) {
-            if (q->is_buffer_indicator && !*finished)
+            if (q->is_buffer_indicator && !*finished){
                 ffp_toggle_buffering(ffp, 1);
+            }
             new_packet = packet_queue_get(q, pkt, 1, serial);
             if (new_packet < 0)
                 return -1;
@@ -1176,6 +1179,12 @@ static void stream_seek(VideoState *is, int64_t pos, int64_t rel, int seek_by_by
         if (seek_by_bytes)
             is->seek_flags |= AVSEEK_FLAG_BYTE;
         is->seek_req = 1;
+        if(strstr(is->ic->iformat->name,"hls")){
+            //如果是hls协议，使用QCRP，来控制tcp读取
+            quit_cur_read = 1;
+            av_log(NULL,AV_LOG_ERROR,"strstr(is->iformat->name,\"hls\") %s \n",
+                   is->ic->iformat->name);
+        }
         SDL_CondSignal(is->continue_read_thread);
     }
 }
@@ -1310,7 +1319,6 @@ static void video_refresh(FFPlayer *opaque, double *remaining_time)
     double time;
 
     Frame *sp, *sp2;
-
     if (!is->paused && get_master_sync_type(is) == AV_SYNC_EXTERNAL_CLOCK && is->realtime)
         check_external_clock_speed(is);
 
@@ -3028,7 +3036,13 @@ out:
 static int decode_interrupt_cb(void *ctx)
 {
     VideoState *is = ctx;
-    return is->abort_request;
+    if(quit_cur_read){
+        return AVERROR_QCRP;
+    }
+    if(is->abort_request){
+        return AVERROR_EXIT;
+    }
+    return 0;
 }
 
 static int stream_has_enough_packets(AVStream *st, int stream_id, PacketQueue *queue, int min_frames) {
@@ -3114,13 +3128,13 @@ static int read_thread(void *arg)
         av_dict_set_int(&ffp->format_opts, "skip-calc-frame-rate", ffp->skip_calc_frame_rate, 0);
     }
 
-    if (ffp->iformat_name)
+    if (ffp->iformat_name){
         is->iformat = av_find_input_format(ffp->iformat_name);
-
-    av_dict_set_intptr(&ffp->format_opts, "video_cache_ptr", (intptr_t)&ffp->stat.video_cache, 0);
-    av_dict_set_intptr(&ffp->format_opts, "audio_cache_ptr", (intptr_t)&ffp->stat.audio_cache, 0);
+    }
     err = avformat_open_input(&ic, is->filename, is->iformat, &ffp->format_opts);
     if (err < 0) {
+        last_error = err;
+        av_log(NULL,AV_LOG_ERROR,"error ==>> %d",err);
         print_error(is->filename, err);
         ret = -1;
         goto fail;
@@ -3369,12 +3383,12 @@ static int read_thread(void *arg)
         }
 #endif
         if (is->seek_req) {
+            quit_cur_read = 0;
             int64_t seek_target = is->seek_pos;
             int64_t seek_min    = is->seek_rel > 0 ? seek_target - is->seek_rel + 2: INT64_MIN;
             int64_t seek_max    = is->seek_rel < 0 ? seek_target - is->seek_rel - 2: INT64_MAX;
 // FIXME the +-2 is due to rounding being not done in the correct direction in generation
 //      of the seek_pos/seek_rel variables
-
             ffp_toggle_buffering(ffp, 1);
             ffp_notify_msg3(ffp, FFP_MSG_BUFFERING_UPDATE, 0, 0);
             ret = avformat_seek_file(is->ic, -1, seek_min, seek_target, seek_max, is->seek_flags);
@@ -3451,7 +3465,9 @@ static int read_thread(void *arg)
         if (is->queue_attachments_req) {
             if (is->video_st && (is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
                 AVPacket copy = { 0 };
-                if ((ret = av_packet_ref(&copy, &is->video_st->attached_pic)) < 0)
+                ret = av_packet_ref(&copy, &is->video_st->attached_pic);
+                av_log(NULL,AV_LOG_ERROR,"av_packet_ref  ret  == %d",ret);
+                if (ret < 0)
                     goto fail;
                 packet_queue_put(&is->videoq, &copy);
                 packet_queue_put_nullpacket(&is->videoq, is->video_stream);
@@ -3485,6 +3501,7 @@ static int read_thread(void *arg)
                 stream_seek(is, ffp->start_time != AV_NOPTS_VALUE ? ffp->start_time : 0, 0, 0);
             } else if (ffp->autoexit) {
                 ret = AVERROR_EOF;
+                av_log(NULL,AV_LOG_ERROR,"ffp->autoexit !!!!!");
                 goto fail;
             } else {
                 ffp_statistic_l(ffp);
@@ -3505,8 +3522,8 @@ static int read_thread(void *arg)
                     ffp_toggle_buffering(ffp, 0);
                     toggle_pause(ffp, 1);
                     if (ffp->error) {
-                        av_log(ffp, AV_LOG_INFO, "ffp_toggle_buffering: error: %d\n", ffp->error);
-                        ffp_notify_msg1(ffp, FFP_MSG_ERROR);
+                        av_log(ffp, AV_LOG_ERROR, "ffp_toggle_buffering: error: %d\n", ffp->error);
+                        ffp_notify_msg2(ffp, FFP_MSG_ERROR,ffp->error);
                     } else {
                         av_log(ffp, AV_LOG_INFO, "ffp_toggle_buffering: completed: OK\n");
                         ffp_notify_msg1(ffp, FFP_MSG_COMPLETED);
@@ -3515,7 +3532,11 @@ static int read_thread(void *arg)
             }
         }
         pkt->flags = 0;
+        //读取线程，会有等待
         ret = av_read_frame(ic, pkt);
+        
+        quit_cur_read = 0;
+
         if (ret < 0) {
             int pb_eof = 0;
             int pb_error = 0;
@@ -3524,7 +3545,7 @@ static int read_thread(void *arg)
                 pb_eof = 1;
                 // check error later
             }
-            if (ic->pb && ic->pb->error) {
+            if (ic->pb && ic->pb->error && ic->pb->error != AVERROR_QCRP) {
                 pb_eof = 1;
                 pb_error = ic->pb->error;
             }
@@ -3551,7 +3572,7 @@ static int read_thread(void *arg)
                     packet_queue_put_nullpacket(&is->subtitleq, is->subtitle_stream);
                 is->eof = 1;
                 ffp->error = pb_error;
-                av_log(ffp, AV_LOG_ERROR, "av_read_frame error: %s\n", ffp_get_error_string(ffp->error));
+                av_log(ffp, AV_LOG_ERROR, "av_read_frame error: %d\n", ffp->error);
                 // break;
             } else {
                 ffp->error = 0;
@@ -3567,6 +3588,7 @@ static int read_thread(void *arg)
             continue;
         } else {
             is->eof = 0;
+            ffp->error = 0;
         }
 
         if (pkt->flags & AV_PKT_FLAG_DISCONTINUITY) {
@@ -3996,6 +4018,7 @@ FFPlayer *ffp_create()
     ffp->meta = ijkmeta_create();
 
     av_opt_set_defaults(ffp);
+
     return ffp;
 }
 
@@ -4136,7 +4159,7 @@ void *ffp_set_ijkio_inject_opaque(FFPlayer *ffp, void *opaque)
     ijkio_manager_destroyp(&ffp->ijkio_manager_ctx);
     ijkio_manager_create(&ffp->ijkio_manager_ctx, ffp);
     ijkio_manager_set_callback(ffp->ijkio_manager_ctx, ijkio_app_func_event);
-    ffp_set_option_intptr(ffp, FFP_OPT_CATEGORY_FORMAT, "ijkiomanager", (uintptr_t)ffp->ijkio_manager_ctx);
+    ffp_set_option_int(ffp, FFP_OPT_CATEGORY_FORMAT, "ijkiomanager", (int64_t)(intptr_t)ffp->ijkio_manager_ctx);
 
     return prev_weak_thiz;
 }
@@ -4150,7 +4173,7 @@ void *ffp_set_inject_opaque(FFPlayer *ffp, void *opaque)
 
     av_application_closep(&ffp->app_ctx);
     av_application_open(&ffp->app_ctx, ffp);
-    ffp_set_option_intptr(ffp, FFP_OPT_CATEGORY_FORMAT, "ijkapplication", (uint64_t)(intptr_t)ffp->app_ctx);
+    ffp_set_option_int(ffp, FFP_OPT_CATEGORY_FORMAT, "ijkapplication", (int64_t)(intptr_t)ffp->app_ctx);
 
     ffp->app_ctx->func_on_app_event = app_func_event;
     return prev_weak_thiz;
@@ -4172,15 +4195,6 @@ void ffp_set_option_int(FFPlayer *ffp, int opt_category, const char *name, int64
 
     AVDictionary **dict = ffp_get_opt_dict(ffp, opt_category);
     av_dict_set_int(dict, name, value, 0);
-}
-
-void ffp_set_option_intptr(FFPlayer *ffp, int opt_category, const char *name, uintptr_t value)
-{
-    if (!ffp)
-        return;
-
-    AVDictionary **dict = ffp_get_opt_dict(ffp, opt_category);
-    av_dict_set_intptr(dict, name, value, 0);
 }
 
 void ffp_set_overlay_format(FFPlayer *ffp, int chroma_fourcc)
@@ -4271,7 +4285,7 @@ int ffp_prepare_async_l(FFPlayer *ffp, const char *file_name)
     }
 
     /* there is a length limit in avformat */
-    if (strlen(file_name) + 1 > 1024) {
+    if (strlen(file_name) + 1 > 10240) {
         av_log(ffp, AV_LOG_ERROR, "%s too long url\n", __func__);
         if (avio_find_protocol_name("ijklongurl:")) {
             av_dict_set(&ffp->format_opts, "ijklongurl-url", file_name, 0);
